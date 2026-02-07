@@ -89,7 +89,7 @@ const processQueue = async () => {
                 ContentDisposition: `attachment; filename="${fileName}"`
             },
             queueSize: 3, 
-            partSize: 10 * 1024 * 1024 
+            partSize: 15 * 1024 * 1024 
         });
 
         await upload.done();
