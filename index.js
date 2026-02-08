@@ -24,14 +24,14 @@ const s3Client = new S3Client({
     },
 });
 
-const MAX_CONCURRENT_UPLOADS = 3; // মেমরি সেফ রাখতে সংখ্যাটি ৫ থেকে কমিয়ে ৩ করা হয়েছে
+const MAX_CONCURRENT_UPLOADS = 2; // মেমরি এবং কানেকশন স্ট্যাবিলিটির জন্য ২ করা হলো
 let runningUploads = 0;           
 const uploadQueue = [];           
 const activeUploads = new Set();  
 const failedFiles = new Set();    
 let cachedAccessToken = null;
 
-// --- ১ ঘণ্টা পর পর ট্র্যাকার পরিষ্কার করা ---
+// --- ট্র্যাকার পরিষ্কার করা ---
 setInterval(() => {
     failedFiles.clear();
     activeUploads.clear();
@@ -51,7 +51,7 @@ const getAccessToken = async (force = false) => {
         cachedAccessToken = res.data.access_token;
         return cachedAccessToken;
     } catch (error) {
-        console.error("[Auth Error] Refresh token failed:", error.response?.data || error.message);
+        console.error("[Auth Error] Token failed:", error.response?.data || error.message);
         return null;
     }
 };
@@ -75,60 +75,65 @@ const processQueue = async () => {
     try {
         const token = await getAccessToken();
         
-        // acknowledgeAbuse=true মুভি বা বড় ফাইলের ৪MD এরর কমাবে
+        // ১. ডাউনলোড রিকোয়েস্ট (acknowledgeAbuse এবং নির্দিষ্ট হেডারসহ)
         const response = await axios({ 
             method: 'get', 
             url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true`, 
-            headers: { Authorization: `Bearer ${token}` },
+            headers: { 
+                'Authorization': `Bearer ${token}`,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' 
+            },
             responseType: 'stream', 
             timeout: 0 
         });
 
+        // ২. R2 আপলোড স্ট্রিম
         const upload = new Upload({
             client: s3Client,
             params: {
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: r2Key,
                 Body: response.data.pipe(new stream.PassThrough()),
-                ContentType: response.headers['content-type'] || 'application/octet-stream',
-                ContentDisposition: `attachment; filename="${fileName}"`
+                ContentType: 'application/octet-stream' // ভিডিও/জিপ সবকিছুর জন্য সেফ
             },
             queueSize: 4, 
-            partSize: 10 * 1024 * 1024 
+            partSize: 15 * 1024 * 1024 // ১৫ মেগাবাইট চাঙ্ক
         });
 
         await upload.done();
         console.log(`[Success] Finished: ${fileName}`);
         activeUploads.delete(fileId);
     } catch (err) {
-        console.error(`[Upload Failed] ID: ${fileId} - Reason:`, err.response?.data?.error?.message || err.message);
+        // বিস্তারিত এরর ডিবাগিং
+        const errorData = err.response?.data;
+        console.error(`[Upload Failed] ID: ${fileId}`);
+        if (err.response?.status === 403) {
+            console.error("Reason: 403 Forbidden. Possible Quota Exceeded or Restricted File.");
+        } else {
+            console.error("Reason:", err.message);
+        }
         failedFiles.add(fileId);
         activeUploads.delete(fileId);
     } finally {
         runningUploads--;
-        setTimeout(processQueue, 1000); // ১ সেকেন্ড বিরতি ডাইনো হেলথ ঠিক রাখতে
+        setTimeout(processQueue, 2000); // ২ সেকেন্ড বিরতি
     }
 };
 
 // --- Routes ---
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.get('/', (req, res) => res.send("R2 Bridge is Active. Use /:fileId to process."));
+app.get('/', (req, res) => res.send("R2 Bridge is Active."));
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
 
     if (!fileId || fileId.length < 15) {
-        return res.status(400).json({ status: "error", message: "Invalid File ID" });
-    }
-
-    if (failedFiles.has(fileId)) {
-        return res.status(410).json({ status: "error", message: "File previously failed. Retrying later." });
+        return res.status(400).json({ status: "error", message: "Invalid ID" });
     }
 
     try {
         const token = await getAccessToken();
-        if (!token) throw new Error("Google Auth Failure");
-
+        
         // ১. মেটাডাটা উদ্ধার
         const metaRes = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size`, {
             headers: { Authorization: `Bearer ${token}` }
@@ -137,7 +142,7 @@ app.get('/:fileId', async (req, res) => {
         const fileName = metaRes.data.name;
         const r2Key = fileName;
 
-        // ২. R2 চেক (ফাইল অলরেডি আছে কিনা)
+        // ২. R2 চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
@@ -154,10 +159,14 @@ app.get('/:fileId', async (req, res) => {
                 presigned_url: presignedUrl
             });
         } catch (e) {
-            console.log(`[System] File not in R2: ${fileName}`);
+            console.log(`[System] Not in R2: ${fileName}`);
         }
 
-        // ৩. কিউতে যুক্ত করা
+        // ৩. কিউ ম্যানেজমেন্ট
+        if (failedFiles.has(fileId)) {
+            return res.status(410).json({ status: "error", message: "File failed previously. Check Google Drive permissions." });
+        }
+
         if (!activeUploads.has(fileId)) {
             activeUploads.add(fileId);
             uploadQueue.push({ fileId, fileName, r2Key });
@@ -167,18 +176,14 @@ app.get('/:fileId', async (req, res) => {
         res.json({
             status: "processing",
             filename: fileName,
-            message: "Upload initiated. Try again in a minute.",
-            queue_position: uploadQueue.length
+            message: "Upload started. Check back soon.",
+            queue_pos: uploadQueue.length
         });
 
     } catch (error) {
-        const errorMsg = error.response?.data?.error?.message || error.message;
-        console.error(`[API Error]`, errorMsg);
-        res.status(error.response?.status || 500).json({ 
-            status: "error", 
-            message: "Google API Error: " + errorMsg 
-        });
+        console.error(`[API Error]`, error.message);
+        res.status(500).json({ status: "error", message: "File not accessible or Google API issue." });
     }
 });
 
-app.listen(PORT, () => console.log(`Worker active on port ${PORT}`));
+app.listen(PORT, () => console.log(`Active on port ${PORT}`));
