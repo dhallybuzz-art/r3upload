@@ -87,12 +87,15 @@ const processQueue = async () => {
         if (!token) throw new Error("Could not acquire access token");
 
         // rclone কমান্ড: সরাসরি Google Drive থেকে R2 তে ডাটা কপি করবে
-        const rcloneCmd = `rclone copyurl "https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true" \
+       const rcloneCmd = `rclone copyurl "https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true" \
         :s3:"${process.env.R2_BUCKET_NAME}/${r2Key}" \
         --header "Authorization: Bearer ${token}" \
         --s3-endpoint "https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
         --s3-access-key-id "${process.env.R2_ACCESS_KEY}" \
         --s3-secret-access-key "${process.env.R2_SECRET_KEY}" \
+        --s3-region auto \
+        --s3-v2-auth=false \
+        --s3-provider Cloudflare \
         --s3-no-check-bucket \
         --ignore-errors \
         -v`;
