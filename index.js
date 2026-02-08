@@ -7,12 +7,14 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// --- ক্রেডেনশিয়ালস (Google Drive API) ---
 const GD_CONFIG = {
     clientId: "328071675996-ac8efr6hk3ijrhovedkqvdaugo7pk2p2.apps.googleusercontent.com",
     clientSecret: "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",
     refreshToken: "1//043JlgFIn7kngCgYIARAAGAQSNwF-L9IrJgqUS2zMSD82DBfBUJNEEvBIJcq8ZA9dGaKLFMP-xO4079ausTkUmZUQBRxuZRHZafQ"
 };
 
+// --- Cloudflare R2 Client কনফিগারেশন ---
 const s3Client = new S3Client({
     region: "auto",
     endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -24,94 +26,134 @@ const s3Client = new S3Client({
 
 const activeUploads = new Set();
 
+// Google Access Token পাওয়ার ফাংশন
 const getAccessToken = async () => {
-    const res = await axios.post('https://oauth2.googleapis.com/token', {
-        client_id: GD_CONFIG.clientId,
-        client_secret: GD_CONFIG.clientSecret,
-        refresh_token: GD_CONFIG.refreshToken,
-        grant_type: 'refresh_token'
-    });
-    return res.data.access_token;
+    try {
+        const res = await axios.post('https://oauth2.googleapis.com/token', {
+            client_id: GD_CONFIG.clientId,
+            client_secret: GD_CONFIG.clientSecret,
+            refresh_token: GD_CONFIG.refreshToken,
+            grant_type: 'refresh_token'
+        });
+        return res.data.access_token;
+    } catch (error) {
+        console.error("[Auth Error] Failed to refresh token.");
+        return null;
+    }
 };
 
-// এই ফাংশনটি গুগল ড্রাইভের বড় ফাইলের সিকিউরিটি ওয়ার্নিং বাইপাস করবে
+// বড় ফাইলের জন্য গুগল ড্রাইভের ৪MD (403) এবং ভাইরাস ওয়ার্নিং বাইপাস লজিকসহ স্থানান্তর ফাংশন
 const startDirectTransfer = async (fileId, fileName) => {
     if (activeUploads.has(fileId)) return;
     activeUploads.add(fileId);
 
     try {
         const token = await getAccessToken();
-        
-        // ১. বড় ফাইলের জন্য ডাউনলোড ইউআরএল (acknowledgeAbuse=true ব্যবহার করে)
-        const downloadUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true`;
+        if (!token) throw new Error("Auth Token not available");
 
+        console.log(`[Bypass Check] Initiating download for large file: ${fileName}`);
+
+        // ১. গুগল ড্রাইভ থেকে ডাটা স্ট্রিম আনা
+        // acknowledgeAbuse=true বড় ফাইলের সিকিউরিটি ওয়ার্নিং বাইপাস করতে সাহায্য করে
         const response = await axios({
             method: 'get',
-            url: downloadUrl,
+            url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true`,
             headers: { Authorization: `Bearer ${token}` },
             responseType: 'stream'
         });
 
+        // ২. AWS SDK দিয়ে সরাসরি R2 তে আপলোড
         const parallelUploads3 = new Upload({
             client: s3Client,
             params: {
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: fileName,
                 Body: response.data,
-                // সরাসরি ডাউনলোডের জন্য হেডার
+                // ফাইলটি ওপেন করলে যাতে সরাসরি ডাউনলোড শুরু হয়
                 ContentDisposition: `attachment; filename="${encodeURIComponent(fileName)}"`
             },
             queueSize: 4, 
-            partSize: 10 * 1024 * 1024,
+            partSize: 10 * 1024 * 1024, // 10MB চাঙ্ক
             leavePartsOnError: false,
         });
 
-        console.log(`[Transfer Start] ${fileName}`);
+        console.log(`[Stream Start] Transferring: ${fileName}`);
         await parallelUploads3.done();
-        console.log(`[Transfer Success] ${fileName}`);
+        console.log(`[Stream Success] Uploaded to R2: ${fileName}`);
     } catch (err) {
-        console.error(`[Fatal Error] ${fileName}: ${err.message}`);
+        // যদি এরর আসে, তবে বিস্তারিত লগ করা
+        console.error(`[Stream Error] ${fileName}:`, err.response?.data ? "Google Security Blocked Access" : err.message);
     } finally {
         activeUploads.delete(fileId);
     }
 };
 
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.get('/', (req, res) => res.send("Engine Ready."));
+app.get('/', (req, res) => res.send("Direct R2 Bridge Engine v3.0 (403 Bypass Enabled) is running."));
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId.trim();
-    if (!fileId || fileId.length < 15) return res.status(400).send("Invalid ID");
+    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
 
     try {
         const token = await getAccessToken();
+        if (!token) return res.status(500).json({ status: "error", message: "Google Auth Failed" });
+
+        // ফাইল মেটাডাটা উদ্ধার
         const meta = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size`, {
             headers: { Authorization: `Bearer ${token}` }
         });
+        
         const fileName = meta.data.name;
+        const fileSize = meta.data.size;
 
         try {
-            const head = await s3Client.send(new HeadObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: fileName }));
-            
-            const presignedUrl = await getSignedUrl(s3Client, new GetObjectCommand({ 
+            // ১. বাকেটে ফাইল আছে কি না চেক করা
+            const headData = await s3Client.send(new HeadObjectCommand({ 
                 Bucket: process.env.R2_BUCKET_NAME, 
-                Key: fileName,
-                ResponseContentDisposition: `attachment; filename="${fileName}"`
-            }), { expiresIn: 3600 });
+                Key: fileName 
+            }));
+            
+            // ২. Presigned URL তৈরি করা (ডাউনলোড ফোর্স করার জন্য ResponseContentDisposition)
+            const presignedUrl = await getSignedUrl(
+                s3Client, 
+                new GetObjectCommand({ 
+                    Bucket: process.env.R2_BUCKET_NAME, 
+                    Key: fileName,
+                    ResponseContentDisposition: `attachment; filename="${fileName}"`
+                }), 
+                { expiresIn: 3600 }
+            );
+            
+            // ৩. পাবলিক ইউআরএল কনস্ট্রাকশন
+            const publicDomain = (process.env.R2_PUBLIC_DOMAIN || '').replace(/\/$/, '');
+            const publicUrl = `${publicDomain}/${encodeURIComponent(fileName)}`;
             
             return res.json({ 
                 status: "success", 
-                filename: fileName, 
-                url: `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(fileName)}`, 
+                filename: fileName,
+                size: headData.ContentLength || fileSize,
+                url: publicUrl, 
                 presigned_url: presignedUrl 
             });
+
         } catch (e) {
+            // ফাইল R2-তে না থাকলে স্থানান্তর শুরু
             startDirectTransfer(fileId, fileName);
-            res.json({ status: "processing", filename: fileName, message: "Bypassing Google 403... Transfer started." });
+            
+            res.json({ 
+                status: "processing", 
+                filename: fileName,
+                size: fileSize,
+                message: "Large file detected. Bypassing Google security & streaming to R2." 
+            });
         }
     } catch (err) {
-        res.status(500).send("API Error: " + err.message);
+        res.status(err.response?.status || 500).json({ 
+            status: "error", 
+            message: err.response?.data?.error?.message || err.message 
+        });
     }
 });
 
-app.listen(PORT, () => console.log(`Worker active on ${PORT}`));
+app.listen(PORT, () => console.log(`Engine active on port ${PORT}`));
