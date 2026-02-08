@@ -32,11 +32,11 @@ const activeUploads = new Set();
 const failedFiles = new Set();    
 let cachedAccessToken = null;
 
-// ১ ঘণ্টা পর পর ট্র্যাকার পরিষ্কার করা (মেমোরি সেফ রাখতে)
+// ১ ঘণ্টা পর পর ট্র্যাকার পরিষ্কার করা
 setInterval(() => {
     failedFiles.clear();
     activeUploads.clear();
-    console.log("[System] Stats reset.");
+    console.log("[System] Stats reset to maintain performance.");
 }, 60 * 60 * 1000); 
 
 // Google Access Token পাওয়ার ফাংশন
@@ -52,7 +52,13 @@ const getAccessToken = async (res = null) => {
         return cachedAccessToken;
     } catch (error) {
         console.error(`[Google Auth Error]`);
-        if (res) res.status(500).json({ status: "error", message: "Auth Failed" });
+        if (res) {
+            res.status(500).json({ 
+                status: "error", 
+                message: "Google Auth Failed", 
+                detail: error.response?.data?.error?.message || error.message 
+            });
+        }
         return null;
     }
 };
@@ -70,14 +76,14 @@ const processQueue = async () => {
         const token = cachedAccessToken || await getAccessToken();
         if (!token) throw new Error("Token failure");
 
-        // Cloudflare R2 এর জন্য AWS4 Signature ফোর্স করার জন্য এনভায়রনমেন্ট সেটআপ
+        // Cloudflare R2 এর জন্য AWS4 Signature এবং সঠিক Auth বাধ্য করার এনভায়রনমেন্ট
         const rcloneEnv = {
             ...process.env,
-            RCLONE_S3_V2_AUTH: "false",
-            RCLONE_S3_REGION: "auto",
+            RCLONE_S3_V2_AUTH: "false",      // v2 বন্ধ করে v4 নিশ্চিত করা
+            RCLONE_S3_USE_V4: "true",        // AWS4 সিগনেচার ফোর্স করা
+            RCLONE_S3_REGION: "auto",        // R2 এর রিজিয়ন auto হতে হবে
             RCLONE_S3_PROVIDER: "Cloudflare",
-            RCLONE_S3_ENV_AUTH: "false",
-            RCLONE_S3_LOCATION_CONSTRAINT: ""
+            RCLONE_S3_ENV_AUTH: "false"
         };
 
         // R2 এর জন্য সঠিক প্যারামিটারসহ rclone কমান্ড
@@ -88,8 +94,8 @@ const processQueue = async () => {
         --s3-access-key-id "${process.env.R2_ACCESS_KEY}" \
         --s3-secret-access-key "${process.env.R2_SECRET_KEY}" \
         --s3-no-check-bucket \
+        --s3-chunk-size 5M \
         --ignore-errors \
-        --s3-upload-concurrency 1 \
         -v`;
 
         exec(rcloneCmd, { env: rcloneEnv }, (error, stdout, stderr) => {
@@ -97,7 +103,7 @@ const processQueue = async () => {
             runningUploads--;
             
             if (error) {
-                console.error(`[Rclone Error] ${fileName}:`, stderr);
+                console.error(`[Rclone Error Detailed]:`, stderr);
                 failedFiles.add(fileId);
             } else {
                 console.log(`[Success] Finished Transfer: ${fileName}`);
@@ -113,12 +119,13 @@ const processQueue = async () => {
     }
 };
 
+// --- Routes ---
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.get('/', (req, res) => res.send("R2 Bridge API is active."));
+app.get('/', (req, res) => res.send("R2 Bridge API is active with Rclone Engine."));
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId.trim();
-    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
+    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID format" });
 
     if (failedFiles.has(fileId)) return res.status(410).json({ status: "error", message: "Download failed previously." });
 
@@ -131,19 +138,43 @@ app.get('/:fileId', async (req, res) => {
         });
         const fileName = metaRes.data.name;
 
+        // R2-তে ফাইল আছে কিনা চেক করা
         try {
-            await s3Client.send(new HeadObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: fileName }));
+            const headData = await s3Client.send(new HeadObjectCommand({
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: fileName
+            }));
+            
             const command = new GetObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: fileName });
             const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
-            return res.json({ status: "success", filename: fileName, url: `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(fileName)}`, presigned_url: presignedUrl });
+            const publicUrl = `${process.env.R2_PUBLIC_DOMAIN.replace(/\/$/, '')}/${encodeURIComponent(fileName)}`;
+            
+            return res.json({
+                status: "success",
+                filename: fileName,
+                size: headData.ContentLength,
+                url: publicUrl,
+                presigned_url: presignedUrl
+            });
         } catch (e) {
-            if (!activeUploads.has(fileId)) {
-                activeUploads.add(fileId);
-                uploadQueue.push({ fileId, fileName, r2Key: fileName });
-                processQueue();
-            }
+            console.log(`[Check] Missing in R2, adding to queue: ${fileName}`);
         }
-        res.json({ status: "processing", filename: fileName, message: "Transfer started via Rclone engine." });
+
+        // কিউতে যুক্ত করা
+        if (!activeUploads.has(fileId)) {
+            activeUploads.add(fileId);
+            uploadQueue.push({ fileId, fileName, r2Key: fileName });
+            processQueue(); 
+        }
+
+        res.json({
+            status: "processing",
+            filename: fileName,
+            message: "File is being transferred to R2 via Rclone AWS4 engine.",
+            queue_position: uploadQueue.length,
+            active_threads: runningUploads
+        });
+
     } catch (error) {
         res.status(500).json({ status: "error", message: "Google API Error" });
     }
