@@ -42,7 +42,7 @@ const getAccessToken = async () => {
     }
 };
 
-// বড় ফাইলের জন্য গুগল ড্রাইভের ৪MD (403) এবং ভাইরাস ওয়ার্নিং বাইপাস লজিকসহ স্থানান্তর ফাংশন
+// ভাইরাস ওয়ার্নিং বাইপাস লজিকসহ স্থানান্তর ফাংশন
 const startDirectTransfer = async (fileId, fileName) => {
     if (activeUploads.has(fileId)) return;
     activeUploads.add(fileId);
@@ -51,13 +51,13 @@ const startDirectTransfer = async (fileId, fileName) => {
         const token = await getAccessToken();
         if (!token) throw new Error("Auth Token not available");
 
-        console.log(`[Bypass Check] Initiating download for large file: ${fileName}`);
+        console.log(`[Security Bypass] Initiating forced download for large file: ${fileName}`);
 
         // ১. গুগল ড্রাইভ থেকে ডাটা স্ট্রিম আনা
-        // acknowledgeAbuse=true বড় ফাইলের সিকিউরিটি ওয়ার্নিং বাইপাস করতে সাহায্য করে
+        // acknowledgeAbuse=true এবং confirm=t প্যারামিটার বড় ফাইলের ভাইরাস ওয়ার্নিং বাইপাস করতে ব্যবহৃত হয়
         const response = await axios({
             method: 'get',
-            url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true`,
+            url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true&confirm=t`,
             headers: { Authorization: `Bearer ${token}` },
             responseType: 'stream'
         });
@@ -69,7 +69,7 @@ const startDirectTransfer = async (fileId, fileName) => {
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: fileName,
                 Body: response.data,
-                // ফাইলটি ওপেন করলে যাতে সরাসরি ডাউনলোড শুরু হয়
+                // ডাউনলোড ফোর্স করার জন্য হেডার
                 ContentDisposition: `attachment; filename="${encodeURIComponent(fileName)}"`
             },
             queueSize: 4, 
@@ -77,19 +77,18 @@ const startDirectTransfer = async (fileId, fileName) => {
             leavePartsOnError: false,
         });
 
-        console.log(`[Stream Start] Transferring: ${fileName}`);
+        console.log(`[Stream Start] Pipeline opened for: ${fileName}`);
         await parallelUploads3.done();
         console.log(`[Stream Success] Uploaded to R2: ${fileName}`);
     } catch (err) {
-        // যদি এরর আসে, তবে বিস্তারিত লগ করা
-        console.error(`[Stream Error] ${fileName}:`, err.response?.data ? "Google Security Blocked Access" : err.message);
+        console.error(`[Fatal Error] ${fileName}:`, err.response?.data ? "Google Security Still Blocking" : err.message);
     } finally {
         activeUploads.delete(fileId);
     }
 };
 
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.get('/', (req, res) => res.send("Direct R2 Bridge Engine v3.0 (403 Bypass Enabled) is running."));
+app.get('/', (req, res) => res.send("Direct R2 Bridge Engine v4.0 (Final Security Bypass) is running."));
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId.trim();
@@ -99,7 +98,6 @@ app.get('/:fileId', async (req, res) => {
         const token = await getAccessToken();
         if (!token) return res.status(500).json({ status: "error", message: "Google Auth Failed" });
 
-        // ফাইল মেটাডাটা উদ্ধার
         const meta = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size`, {
             headers: { Authorization: `Bearer ${token}` }
         });
@@ -108,13 +106,11 @@ app.get('/:fileId', async (req, res) => {
         const fileSize = meta.data.size;
 
         try {
-            // ১. বাকেটে ফাইল আছে কি না চেক করা
             const headData = await s3Client.send(new HeadObjectCommand({ 
                 Bucket: process.env.R2_BUCKET_NAME, 
                 Key: fileName 
             }));
             
-            // ২. Presigned URL তৈরি করা (ডাউনলোড ফোর্স করার জন্য ResponseContentDisposition)
             const presignedUrl = await getSignedUrl(
                 s3Client, 
                 new GetObjectCommand({ 
@@ -125,7 +121,6 @@ app.get('/:fileId', async (req, res) => {
                 { expiresIn: 3600 }
             );
             
-            // ৩. পাবলিক ইউআরএল কনস্ট্রাকশন
             const publicDomain = (process.env.R2_PUBLIC_DOMAIN || '').replace(/\/$/, '');
             const publicUrl = `${publicDomain}/${encodeURIComponent(fileName)}`;
             
@@ -138,14 +133,12 @@ app.get('/:fileId', async (req, res) => {
             });
 
         } catch (e) {
-            // ফাইল R2-তে না থাকলে স্থানান্তর শুরু
             startDirectTransfer(fileId, fileName);
-            
             res.json({ 
                 status: "processing", 
                 filename: fileName,
                 size: fileSize,
-                message: "Large file detected. Bypassing Google security & streaming to R2." 
+                message: "Large file detected. Bypassing Google security tokens..." 
             });
         }
     } catch (err) {
