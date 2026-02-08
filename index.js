@@ -52,9 +52,16 @@ const getAccessToken = async () => {
         cachedAccessToken = res.data.access_token;
         return cachedAccessToken;
     } catch (error) {
-        console.error("[Auth Error] Token refresh failed.");
-        return null;
-    }
+    // আগের Console.error এর বদলে এটি দিন
+    const errorData = error.response ? error.response.data : error.message;
+    console.error(`[Google API Error Detailed]:`, JSON.stringify(errorData));
+    
+    res.status(500).json({ 
+        status: "error", 
+        message: "Google API Error",
+        detail: error.response?.data?.error?.message || error.message 
+    });
+}
 };
 
 // --- R2 Presigned URL জেনারেটর ---
