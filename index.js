@@ -51,7 +51,7 @@ const startDirectTransfer = async (fileId, fileName) => {
         const token = await getAccessToken();
         if (!token) throw new Error("Auth Token not available");
 
-        // ১. গুগল ড্রাইভ থেকে ডাটা স্ট্রিম আনা
+        // ১. গুগল ড্রাইভ থেকে ডাটা স্ট্রিম আনা (acknowledgeAbuse=true বড় ফাইলের জন্য জরুরি)
         const response = await axios({
             method: 'get',
             url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true`,
@@ -61,17 +61,18 @@ const startDirectTransfer = async (fileId, fileName) => {
 
         // ২. AWS SDK দিয়ে সরাসরি R2 তে মাল্টিপার্ট আপলোড
         const parallelUploads3 = new Upload({
-    client: s3Client,
-    params: {
-        Bucket: process.env.R2_BUCKET_NAME,
-        Key: fileName,
-        Body: response.data,
-        ContentDisposition: `attachment; filename="${fileName}"`, // এই লাইনটি যোগ করুন
-    },
-    queueSize: 4, 
-    partSize: 10 * 1024 * 1024,
-    leavePartsOnError: false,
-});
+            client: s3Client,
+            params: {
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: fileName,
+                Body: response.data,
+                // ফাইলটি ওপেন করলে যাতে সরাসরি ডাউনলোড হয় (inline play এর বদলে)
+                ContentDisposition: `attachment; filename="${encodeURIComponent(fileName)}"`
+            },
+            queueSize: 4, 
+            partSize: 10 * 1024 * 1024, // 10MB চাঙ্ক
+            leavePartsOnError: false,
+        });
 
         console.log(`[Stream Start] Transferring: ${fileName}`);
         await parallelUploads3.done();
@@ -109,10 +110,14 @@ app.get('/:fileId', async (req, res) => {
                 Key: fileName 
             }));
             
-            // ২. Presigned URL তৈরি করা (১ ঘণ্টা মেয়াদী)
+            // ২. Presigned URL তৈরি করা (ডাউনলোড ফোর্স করার জন্য ResponseContentDisposition ব্যবহার করা হয়েছে)
             const presignedUrl = await getSignedUrl(
                 s3Client, 
-                new GetObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: fileName }), 
+                new GetObjectCommand({ 
+                    Bucket: process.env.R2_BUCKET_NAME, 
+                    Key: fileName,
+                    ResponseContentDisposition: `attachment; filename="${fileName}"`
+                }), 
                 { expiresIn: 3600 }
             );
             
@@ -136,7 +141,7 @@ app.get('/:fileId', async (req, res) => {
                 status: "processing", 
                 filename: fileName,
                 size: fileSize,
-                message: "Streaming data directly to R2. Please wait and refresh." 
+                message: "Streaming data directly to R2. Large file download initiated." 
             });
         }
     } catch (err) {
