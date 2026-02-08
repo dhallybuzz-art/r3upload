@@ -8,7 +8,7 @@ const stream = require('stream');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- ক্রেডেনশিয়ালস (নিরাপত্তার জন্য এগুলো Heroku Config Vars এ রাখা ভালো) ---
+// --- ক্রেডেনশিয়ালস ---
 const GD_CONFIG = {
     clientId: "328071675996-ac8efr6hk3ijrhovedkqvdaugo7pk2p2.apps.googleusercontent.com",
     clientSecret: "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",
@@ -24,7 +24,7 @@ const s3Client = new S3Client({
     },
 });
 
-const MAX_CONCURRENT_UPLOADS = 5; 
+const MAX_CONCURRENT_UPLOADS = 3; // মেমরি সেফ রাখতে সংখ্যাটি ৫ থেকে কমিয়ে ৩ করা হয়েছে
 let runningUploads = 0;           
 const uploadQueue = [];           
 const activeUploads = new Set();  
@@ -35,11 +35,12 @@ let cachedAccessToken = null;
 setInterval(() => {
     failedFiles.clear();
     activeUploads.clear();
-    console.log("[System] Tracker cleared.");
+    console.log("[System] Stats tracker reset.");
 }, 60 * 60 * 1000); 
 
-// --- Google Access Token পাওয়ার ফাংশন ---
-const getAccessToken = async () => {
+// --- Google Access Token পাওয়ার ফাংশন ---
+const getAccessToken = async (force = false) => {
+    if (cachedAccessToken && !force) return cachedAccessToken;
     try {
         const res = await axios.post('https://oauth2.googleapis.com/token', {
             client_id: GD_CONFIG.clientId,
@@ -59,9 +60,7 @@ const generatePresignedUrl = async (bucketName, key) => {
     try {
         const command = new GetObjectCommand({ Bucket: bucketName, Key: key });
         return await getSignedUrl(s3Client, command, { expiresIn: 3600 });
-    } catch (error) { 
-        return null; 
-    }
+    } catch (error) { return null; }
 };
 
 const processQueue = async () => {
@@ -71,13 +70,15 @@ const processQueue = async () => {
     runningUploads++;
     
     const { fileId, fileName, r2Key } = task;
-    console.log(`[Upload] Starting: ${fileName}`);
+    console.log(`[Upload] Processing: ${fileName}`);
     
     try {
-        const token = cachedAccessToken || await getAccessToken();
+        const token = await getAccessToken();
+        
+        // acknowledgeAbuse=true মুভি বা বড় ফাইলের ৪MD এরর কমাবে
         const response = await axios({ 
             method: 'get', 
-            url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, 
+            url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true`, 
             headers: { Authorization: `Bearer ${token}` },
             responseType: 'stream', 
             timeout: 0 
@@ -92,30 +93,27 @@ const processQueue = async () => {
                 ContentType: response.headers['content-type'] || 'application/octet-stream',
                 ContentDisposition: `attachment; filename="${fileName}"`
             },
-            queueSize: 3, 
-            partSize: 10 * 1024 * 1024 // 10MB chunks
+            queueSize: 4, 
+            partSize: 10 * 1024 * 1024 
         });
 
         await upload.done();
-        console.log(`[Success] ${fileName}`);
+        console.log(`[Success] Finished: ${fileName}`);
         activeUploads.delete(fileId);
     } catch (err) {
-        console.error(`[Upload Failed] ID: ${fileId} - Error:`, err.message);
+        console.error(`[Upload Failed] ID: ${fileId} - Reason:`, err.response?.data?.error?.message || err.message);
         failedFiles.add(fileId);
         activeUploads.delete(fileId);
     } finally {
         runningUploads--;
-        setTimeout(processQueue, 500);
+        setTimeout(processQueue, 1000); // ১ সেকেন্ড বিরতি ডাইনো হেলথ ঠিক রাখতে
     }
 };
 
-// --- Favicon handling (To avoid 400 errors) ---
+// --- Routes ---
 app.get('/favicon.ico', (req, res) => res.status(204).end());
+app.get('/', (req, res) => res.send("R2 Bridge is Active. Use /:fileId to process."));
 
-// --- Root check ---
-app.get('/', (req, res) => res.send("R2 Bridge API is running..."));
-
-// --- Main File Handler ---
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
 
@@ -124,28 +122,22 @@ app.get('/:fileId', async (req, res) => {
     }
 
     if (failedFiles.has(fileId)) {
-        return res.status(410).json({ status: "error", message: "File download failed on previous attempt." });
+        return res.status(410).json({ status: "error", message: "File previously failed. Retrying later." });
     }
 
     try {
-        const token = cachedAccessToken || await getAccessToken();
-        if (!token) throw new Error("Could not retrieve Google Access Token");
-        
-        // ১. মেটাডাটা উদ্ধার (ফাইল আছে কি না চেক)
-        let metaRes;
-        try {
-            metaRes = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size,mimeType`, {
-                headers: { Authorization: `Bearer ${token}` }
-            });
-        } catch (gErr) {
-            console.error(`[Google API Error] ID: ${fileId}`, gErr.response?.data || gErr.message);
-            return res.status(404).json({ status: "error", message: "File not found on Google Drive or no permission." });
-        }
+        const token = await getAccessToken();
+        if (!token) throw new Error("Google Auth Failure");
+
+        // ১. মেটাডাটা উদ্ধার
+        const metaRes = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size`, {
+            headers: { Authorization: `Bearer ${token}` }
+        });
 
         const fileName = metaRes.data.name;
         const r2Key = fileName;
 
-        // ২. R2 চেক
+        // ২. R2 চেক (ফাইল অলরেডি আছে কিনা)
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
@@ -153,18 +145,16 @@ app.get('/:fileId', async (req, res) => {
             }));
             
             const presignedUrl = await generatePresignedUrl(process.env.R2_BUCKET_NAME, r2Key);
-            const publicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(r2Key)}`;
             
             return res.json({
                 status: "success",
                 filename: fileName,
                 size: headData.ContentLength,
-                url: publicUrl,
+                url: `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(r2Key)}`,
                 presigned_url: presignedUrl
             });
-        } catch (e) { 
-            // ফাইল R2 তে নেই, আপলোড শুরু হবে
-            console.log(`[Queue] File not in R2, adding to queue: ${fileName}`);
+        } catch (e) {
+            console.log(`[System] File not in R2: ${fileName}`);
         }
 
         // ৩. কিউতে যুক্ত করা
@@ -177,14 +167,18 @@ app.get('/:fileId', async (req, res) => {
         res.json({
             status: "processing",
             filename: fileName,
-            message: "File is being uploaded to R2. Please check back in a few minutes.",
-            queue_length: uploadQueue.length
+            message: "Upload initiated. Try again in a minute.",
+            queue_position: uploadQueue.length
         });
 
     } catch (error) {
-        console.error("[System Error]", error.message);
-        res.status(500).json({ status: "error", message: "Internal Server Error" });
+        const errorMsg = error.response?.data?.error?.message || error.message;
+        console.error(`[API Error]`, errorMsg);
+        res.status(error.response?.status || 500).json({ 
+            status: "error", 
+            message: "Google API Error: " + errorMsg 
+        });
     }
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Worker active on port ${PORT}`));
