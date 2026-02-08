@@ -3,7 +3,6 @@ const axios = require('axios');
 const { exec } = require('child_process');
 const { S3Client, HeadObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
-const stream = require('stream');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -26,42 +25,43 @@ const s3Client = new S3Client({
 });
 
 // --- স্টেট ম্যানেজমেন্ট, ট্র্যাকিং এবং কিউ ---
-const MAX_CONCURRENT_UPLOADS = 2; // Heroku-র স্ট্যাবিলিটির জন্য ২ টি থ্রেড রাখা হয়েছে
+const MAX_CONCURRENT_UPLOADS = 2; 
 let runningUploads = 0;           
 const uploadQueue = [];           
 const activeUploads = new Set();  
 const failedFiles = new Set();    
 let cachedAccessToken = null;
 
-// --- ১ ঘণ্টা পর পর ট্র্যাকার পরিষ্কার করা (মেমোরি সেফ রাখতে) ---
+// --- ১ ঘণ্টা পর পর ট্র্যাকার পরিষ্কার করা ---
 setInterval(() => {
     failedFiles.clear();
     activeUploads.clear();
     console.log("[System] Stats reset to maintain performance.");
 }, 60 * 60 * 1000); 
 
-// --- Google Access Token পাওয়ার ফাংশন ---
-const getAccessToken = async () => {
+// --- Google Access Token পাওয়ার ফাংশন ---
+const getAccessToken = async (res = null) => {
     try {
-        const res = await axios.post('https://oauth2.googleapis.com/token', {
+        const response = await axios.post('https://oauth2.googleapis.com/token', {
             client_id: GD_CONFIG.clientId,
             client_secret: GD_CONFIG.clientSecret,
             refresh_token: GD_CONFIG.refreshToken,
             grant_type: 'refresh_token'
         });
-        cachedAccessToken = res.data.access_token;
+        cachedAccessToken = response.data.access_token;
         return cachedAccessToken;
     } catch (error) {
-    // আগের Console.error এর বদলে এটি দিন
-    const errorData = error.response ? error.response.data : error.message;
-    console.error(`[Google API Error Detailed]:`, JSON.stringify(errorData));
-    
-    res.status(500).json({ 
-        status: "error", 
-        message: "Google API Error",
-        detail: error.response?.data?.error?.message || error.message 
-    });
-}
+        const errorData = error.response ? error.response.data : error.message;
+        console.error(`[Google Auth Error]:`, JSON.stringify(errorData));
+        if (res) {
+            res.status(500).json({ 
+                status: "error", 
+                message: "Google Auth Failed", 
+                detail: error.response?.data?.error?.message || error.message 
+            });
+        }
+        return null;
+    }
 };
 
 // --- R2 Presigned URL জেনারেটর ---
@@ -74,7 +74,6 @@ const generatePresignedUrl = async (bucketName, key) => {
 
 // --- Main Engine: rclone Queue Processor ---
 const processQueue = async () => {
-    // যদি কিউ খালি থাকে বা রানিং লিমিট ফুল থাকে তবে থামুন
     if (runningUploads >= MAX_CONCURRENT_UPLOADS || uploadQueue.length === 0) return;
 
     const task = uploadQueue.shift(); 
@@ -85,9 +84,9 @@ const processQueue = async () => {
     
     try {
         const token = cachedAccessToken || await getAccessToken();
-        
+        if (!token) throw new Error("Could not acquire access token");
+
         // rclone কমান্ড: সরাসরি Google Drive থেকে R2 তে ডাটা কপি করবে
-        [cite_start]// --drive-acknowledge-abuse ফ্ল্যাগটি ৪MD (Forbidden) এরর আটকাবে [cite: 1]
         const rcloneCmd = `rclone copyurl "https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true" \
         :s3:"${process.env.R2_BUCKET_NAME}/${r2Key}" \
         --header "Authorization: Bearer ${token}" \
@@ -98,7 +97,6 @@ const processQueue = async () => {
         --ignore-errors \
         -v`;
 
-        // কমান্ড এক্সিকিউট করা
         exec(rcloneCmd, (error, stdout, stderr) => {
             activeUploads.delete(fileId);
             runningUploads--;
@@ -110,12 +108,11 @@ const processQueue = async () => {
                 console.log(`[Success] Finished Transfer: ${fileName}`);
             }
             
-            // পরবর্তী টাস্ক প্রসেস করার জন্য কিউ চেক করুন
             setTimeout(processQueue, 1500);
         });
 
     } catch (err) {
-        console.error(`[Internal Error] ID: ${fileId}`, err.message);
+        console.error(`[Internal Error] ID: ${fileId} - ${err.message}`);
         activeUploads.delete(fileId);
         runningUploads--;
         setTimeout(processQueue, 1500);
@@ -123,29 +120,23 @@ const processQueue = async () => {
 };
 
 // --- Routes ---
-
-// ১. Favicon হ্যান্ডলার (Status 204: No Content)
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-
-// ২. হোম রুট
 app.get('/', (req, res) => res.send("R2 Bridge API v2.0 (Powered by Rclone) is running."));
 
-// ৩. মেইন এপিআই রুট
 app.get('/:fileId', async (req, res) => {
-    const fileId = req.params.fileId;
+    const fileId = req.params.fileId.trim();
     
-    // ফাইল আইডি ভ্যালিডেশন
     if (!fileId || fileId.length < 15) {
         return res.status(400).json({ status: "error", message: "Invalid ID format" });
     }
 
-    // যদি ফাইলটি আগে ফেইল হয়ে থাকে
     if (failedFiles.has(fileId)) {
         return res.status(410).json({ status: "error", message: "Download failed previously. Check Google Drive permissions." });
     }
 
     try {
-        const token = cachedAccessToken || await getAccessToken();
+        const token = await getAccessToken(res);
+        if (!token) return; // Error handled inside getAccessToken
         
         // ১. গুগল ড্রাইভ থেকে মেটাডাটা উদ্ধার
         const metaRes = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size`, {
@@ -172,11 +163,10 @@ app.get('/:fileId', async (req, res) => {
                 presigned_url: presignedUrl
             });
         } catch (e) {
-            // ফাইল R2 তে নেই, আপলোড শুরু করতে হবে
             console.log(`[Check] File missing in R2, initiating rclone: ${fileName}`);
         }
 
-        // ৩. কিউতে যুক্ত করা এবং প্রসেস করা
+        // ৩. কিউতে যুক্ত করা
         if (!activeUploads.has(fileId)) {
             activeUploads.add(fileId);
             uploadQueue.push({ fileId, fileName, r2Key });
@@ -186,22 +176,21 @@ app.get('/:fileId', async (req, res) => {
         res.json({
             status: "processing",
             filename: fileName,
-            message: "File is being transferred from Google Drive to R2 via Rclone.",
+            message: "File is being transferred to R2 via Rclone engine.",
             queue_position: uploadQueue.length,
             active_threads: runningUploads
         });
 
     } catch (error) {
-    // আগের Console.error এর বদলে এটি দিন
-    const errorData = error.response ? error.response.data : error.message;
-    console.error(`[Google API Error Detailed]:`, JSON.stringify(errorData));
-    
-    res.status(500).json({ 
-        status: "error", 
-        message: "Google API Error",
-        detail: error.response?.data?.error?.message || error.message 
-    });
-}
+        const errorData = error.response ? error.response.data : error.message;
+        console.error(`[Google API Error Detailed]:`, JSON.stringify(errorData));
+        
+        res.status(error.response?.status || 500).json({ 
+            status: "error", 
+            message: "Google API Error", 
+            detail: error.response?.data?.error?.message || error.message 
+        });
+    }
 });
 
 app.listen(PORT, () => console.log(`Worker active on port ${PORT}. Rclone engine is ready.`));
