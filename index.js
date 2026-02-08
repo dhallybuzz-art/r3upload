@@ -61,16 +61,17 @@ const startDirectTransfer = async (fileId, fileName) => {
 
         // ২. AWS SDK দিয়ে সরাসরি R2 তে মাল্টিপার্ট আপলোড
         const parallelUploads3 = new Upload({
-            client: s3Client,
-            params: {
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: fileName,
-                Body: response.data,
-            },
-            queueSize: 4, 
-            partSize: 10 * 1024 * 1024, // 10MB চাঙ্ক
-            leavePartsOnError: false,
-        });
+    client: s3Client,
+    params: {
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: fileName,
+        Body: response.data,
+        ContentDisposition: `attachment; filename="${fileName}"`, // এই লাইনটি যোগ করুন
+    },
+    queueSize: 4, 
+    partSize: 10 * 1024 * 1024,
+    leavePartsOnError: false,
+});
 
         console.log(`[Stream Start] Transferring: ${fileName}`);
         await parallelUploads3.done();
