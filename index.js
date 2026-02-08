@@ -24,7 +24,7 @@ const s3Client = new S3Client({
     },
 });
 
-// --- স্টেট ম্যানেজমেন্ট, ট্র্যাকিং এবং কিউ ---
+// --- স্টেট ম্যানেজমেন্ট এবং ট্র্যাকিং ---
 const MAX_CONCURRENT_UPLOADS = 2; 
 let runningUploads = 0;           
 const uploadQueue = [];           
@@ -32,7 +32,7 @@ const activeUploads = new Set();
 const failedFiles = new Set();    
 let cachedAccessToken = null;
 
-// --- ১ ঘণ্টা পর পর ট্র্যাকার পরিষ্কার করা ---
+// মেমোরি পরিষ্কার রাখার জন্য ১ ঘণ্টা পর পর স্ট্যাটাস রিসেট
 setInterval(() => {
     failedFiles.clear();
     activeUploads.clear();
@@ -84,10 +84,10 @@ const processQueue = async () => {
     
     try {
         const token = cachedAccessToken || await getAccessToken();
-        if (!token) throw new Error("Could not acquire access token");
+        if (!token) throw new Error("Token failure");
 
-        // rclone কমান্ড: সরাসরি Google Drive থেকে R2 তে ডাটা কপি করবে
-       const rcloneCmd = `rclone copyurl "https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true" \
+        // rclone কমান্ড: R2 এর AWS4 Signature এবং সঠিক পোর্টের জন্য আপডেট করা হয়েছে
+        const rcloneCmd = `rclone copyurl "https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true" \
         :s3:"${process.env.R2_BUCKET_NAME}/${r2Key}" \
         --header "Authorization: Bearer ${token}" \
         --s3-endpoint "https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
@@ -111,6 +111,7 @@ const processQueue = async () => {
                 console.log(`[Success] Finished Transfer: ${fileName}`);
             }
             
+            // কিউ থেকে পরবর্তী ফাইল প্রসেস করা
             setTimeout(processQueue, 1500);
         });
 
@@ -134,14 +135,14 @@ app.get('/:fileId', async (req, res) => {
     }
 
     if (failedFiles.has(fileId)) {
-        return res.status(410).json({ status: "error", message: "Download failed previously. Check Google Drive permissions." });
+        return res.status(410).json({ status: "error", message: "Download failed previously. Check Google permissions." });
     }
 
     try {
         const token = await getAccessToken(res);
-        if (!token) return; // Error handled inside getAccessToken
+        if (!token) return; 
         
-        // ১. গুগল ড্রাইভ থেকে মেটাডাটা উদ্ধার
+        // ১. মেটাডাটা উদ্ধার
         const metaRes = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size`, {
             headers: { Authorization: `Bearer ${token}` }
         });
@@ -149,7 +150,7 @@ app.get('/:fileId', async (req, res) => {
         const fileName = metaRes.data.name;
         const r2Key = fileName;
 
-        // ২. চেক করা হচ্ছে ফাইলটি অলরেডি R2 তে আছে কিনা
+        // ২. R2-তে ফাইল আছে কিনা চেক করা
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
@@ -157,16 +158,18 @@ app.get('/:fileId', async (req, res) => {
             }));
             
             const presignedUrl = await generatePresignedUrl(process.env.R2_BUCKET_NAME, r2Key);
+            const publicUrl = `${process.env.R2_PUBLIC_DOMAIN.replace(/\/$/, '')}/${encodeURIComponent(r2Key)}`;
             
             return res.json({
                 status: "success",
                 filename: fileName,
                 size: headData.ContentLength,
-                url: `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(r2Key)}`,
+                url: publicUrl,
                 presigned_url: presignedUrl
             });
         } catch (e) {
-            console.log(`[Check] File missing in R2, initiating rclone: ${fileName}`);
+            // ফাইল R2 তে নেই
+            console.log(`[Check] Missing in R2, adding to queue: ${fileName}`);
         }
 
         // ৩. কিউতে যুক্ত করা
@@ -179,7 +182,7 @@ app.get('/:fileId', async (req, res) => {
         res.json({
             status: "processing",
             filename: fileName,
-            message: "File is being transferred to R2 via Rclone engine.",
+            message: "File is being transferred from Google Drive to R2 via Rclone.",
             queue_position: uploadQueue.length,
             active_threads: runningUploads
         });
