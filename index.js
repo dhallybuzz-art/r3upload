@@ -1,9 +1,8 @@
 const express = require('express');
 const axios = require('axios');
+const { exec } = require('child_process');
 const { S3Client, HeadObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
-const { Upload } = require('@aws-sdk/lib-storage');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
-const stream = require('stream');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,23 +23,20 @@ const s3Client = new S3Client({
     },
 });
 
-const MAX_CONCURRENT_UPLOADS = 2; // মেমরি এবং কানেকশন স্ট্যাবিলিটির জন্য ২ করা হলো
-let runningUploads = 0;           
-const uploadQueue = [];           
+// --- ট্র্যাকার এবং কিউ ---
 const activeUploads = new Set();  
 const failedFiles = new Set();    
 let cachedAccessToken = null;
 
-// --- ট্র্যাকার পরিষ্কার করা ---
+// ১ ঘণ্টা পর পর ট্র্যাকার পরিষ্কার
 setInterval(() => {
     failedFiles.clear();
     activeUploads.clear();
-    console.log("[System] Stats tracker reset.");
+    console.log("[System] Stats reset.");
 }, 60 * 60 * 1000); 
 
-// --- Google Access Token পাওয়ার ফাংশন ---
-const getAccessToken = async (force = false) => {
-    if (cachedAccessToken && !force) return cachedAccessToken;
+// --- Google Access Token পাওয়ার ফাংশন ---
+const getAccessToken = async () => {
     try {
         const res = await axios.post('https://oauth2.googleapis.com/token', {
             client_id: GD_CONFIG.clientId,
@@ -51,7 +47,7 @@ const getAccessToken = async (force = false) => {
         cachedAccessToken = res.data.access_token;
         return cachedAccessToken;
     } catch (error) {
-        console.error("[Auth Error] Token failed:", error.response?.data || error.message);
+        console.error("[Auth Error] Token failed");
         return null;
     }
 };
@@ -63,72 +59,46 @@ const generatePresignedUrl = async (bucketName, key) => {
     } catch (error) { return null; }
 };
 
-const processQueue = async () => {
-    if (runningUploads >= MAX_CONCURRENT_UPLOADS || uploadQueue.length === 0) return;
+// --- rclone আপলোড ফাংশন (যেটা কিউ এবং স্ট্রিম হ্যান্ডেল করবে) ---
+const runRcloneUpload = async (fileId, fileName, r2Key, token) => {
+    if (activeUploads.has(fileId)) return;
+    activeUploads.add(fileId);
 
-    const task = uploadQueue.shift(); 
-    runningUploads++;
-    
-    const { fileId, fileName, r2Key } = task;
-    console.log(`[Upload] Processing: ${fileName}`);
-    
-    try {
-        const token = await getAccessToken();
-        
-        // ১. ডাউনলোড রিকোয়েস্ট (acknowledgeAbuse এবং নির্দিষ্ট হেডারসহ)
-        const response = await axios({ 
-            method: 'get', 
-            url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true`, 
-            headers: { 
-                'Authorization': `Bearer ${token}`,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' 
-            },
-            responseType: 'stream', 
-            timeout: 0 
-        });
+    console.log(`[rclone] Started: ${fileName}`);
 
-        // ২. R2 আপলোড স্ট্রিম
-        const upload = new Upload({
-            client: s3Client,
-            params: {
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: r2Key,
-                Body: response.data.pipe(new stream.PassThrough()),
-                ContentType: 'application/octet-stream' // ভিডিও/জিপ সবকিছুর জন্য সেফ
-            },
-            queueSize: 4, 
-            partSize: 15 * 1024 * 1024 // ১৫ মেগাবাইট চাঙ্ক
-        });
+    // rclone সরাসরি কপি করবে, যা আপনার কোডের Manual Upload-এর বিকল্প
+    const rcloneCmd = `rclone copyurl "https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true" \
+    :s3:"${process.env.R2_BUCKET_NAME}/${r2Key}" \
+    --header "Authorization: Bearer ${token}" \
+    --s3-endpoint "https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+    --s3-access-key-id "${process.env.R2_ACCESS_KEY}" \
+    --s3-secret-access-key "${process.env.R2_SECRET_KEY}" \
+    --s3-no-check-bucket \
+    --ignore-errors \
+    -v`;
 
-        await upload.done();
-        console.log(`[Success] Finished: ${fileName}`);
+    exec(rcloneCmd, (error, stdout, stderr) => {
         activeUploads.delete(fileId);
-    } catch (err) {
-        // বিস্তারিত এরর ডিবাগিং
-        const errorData = err.response?.data;
-        console.error(`[Upload Failed] ID: ${fileId}`);
-        if (err.response?.status === 403) {
-            console.error("Reason: 403 Forbidden. Possible Quota Exceeded or Restricted File.");
-        } else {
-            console.error("Reason:", err.message);
+        if (error) {
+            console.error(`[rclone Error] ${fileName}:`, stderr);
+            failedFiles.add(fileId);
+            return;
         }
-        failedFiles.add(fileId);
-        activeUploads.delete(fileId);
-    } finally {
-        runningUploads--;
-        setTimeout(processQueue, 2000); // ২ সেকেন্ড বিরতি
-    }
+        console.log(`[rclone Success] ${fileName}`);
+    });
 };
 
 // --- Routes ---
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.get('/', (req, res) => res.send("R2 Bridge is Active."));
+app.get('/', (req, res) => res.send("R2 Bridge with rclone is Running."));
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
+    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
 
-    if (!fileId || fileId.length < 15) {
-        return res.status(400).json({ status: "error", message: "Invalid ID" });
+    // আগে ফেইল হয়েছে কিনা চেক
+    if (failedFiles.has(fileId)) {
+        return res.status(410).json({ status: "error", message: "Download failed previously." });
     }
 
     try {
@@ -142,7 +112,7 @@ app.get('/:fileId', async (req, res) => {
         const fileName = metaRes.data.name;
         const r2Key = fileName;
 
-        // ২. R2 চেক
+        // ২. R2-তে ফাইল আছে কিনা চেক
         try {
             const headData = await s3Client.send(new HeadObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
@@ -159,31 +129,23 @@ app.get('/:fileId', async (req, res) => {
                 presigned_url: presignedUrl
             });
         } catch (e) {
-            console.log(`[System] Not in R2: ${fileName}`);
-        }
-
-        // ৩. কিউ ম্যানেজমেন্ট
-        if (failedFiles.has(fileId)) {
-            return res.status(410).json({ status: "error", message: "File failed previously. Check Google Drive permissions." });
-        }
-
-        if (!activeUploads.has(fileId)) {
-            activeUploads.add(fileId);
-            uploadQueue.push({ fileId, fileName, r2Key });
-            processQueue(); 
+            // ফাইল নেই, ব্যাকগ্রাউন্ডে rclone শুরু হবে
+            if (!activeUploads.has(fileId)) {
+                runRcloneUpload(fileId, fileName, r2Key, token);
+            }
         }
 
         res.json({
             status: "processing",
             filename: fileName,
-            message: "Upload started. Check back soon.",
-            queue_pos: uploadQueue.length
+            message: "Transfer started via rclone. Check back in a few minutes.",
+            is_active: activeUploads.has(fileId)
         });
 
     } catch (error) {
         console.error(`[API Error]`, error.message);
-        res.status(500).json({ status: "error", message: "File not accessible or Google API issue." });
+        res.status(500).json({ status: "error", message: "Google API Error" });
     }
 });
 
-app.listen(PORT, () => console.log(`Active on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
