@@ -192,9 +192,16 @@ app.get('/:fileId', async (req, res) => {
         });
 
     } catch (error) {
-        console.error(`[API Error]`, error.message);
-        res.status(500).json({ status: "error", message: "Google API Error or Restricted File" });
-    }
+    // আগের Console.error এর বদলে এটি দিন
+    const errorData = error.response ? error.response.data : error.message;
+    console.error(`[Google API Error Detailed]:`, JSON.stringify(errorData));
+    
+    res.status(500).json({ 
+        status: "error", 
+        message: "Google API Error",
+        detail: error.response?.data?.error?.message || error.message 
+    });
+}
 });
 
 app.listen(PORT, () => console.log(`Worker active on port ${PORT}. Rclone engine is ready.`));
