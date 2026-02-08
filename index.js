@@ -8,7 +8,7 @@ const stream = require('stream');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- আপনার দেওয়া ক্রেডেনশিয়ালস ---
+// --- ক্রেডেনশিয়ালস (নিরাপত্তার জন্য এগুলো Heroku Config Vars এ রাখা ভালো) ---
 const GD_CONFIG = {
     clientId: "328071675996-ac8efr6hk3ijrhovedkqvdaugo7pk2p2.apps.googleusercontent.com",
     clientSecret: "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",
@@ -35,6 +35,7 @@ let cachedAccessToken = null;
 setInterval(() => {
     failedFiles.clear();
     activeUploads.clear();
+    console.log("[System] Tracker cleared.");
 }, 60 * 60 * 1000); 
 
 // --- Google Access Token পাওয়ার ফাংশন ---
@@ -49,7 +50,7 @@ const getAccessToken = async () => {
         cachedAccessToken = res.data.access_token;
         return cachedAccessToken;
     } catch (error) {
-        console.error("[Auth Error] Failed to refresh token");
+        console.error("[Auth Error] Refresh token failed:", error.response?.data || error.message);
         return null;
     }
 };
@@ -58,7 +59,9 @@ const generatePresignedUrl = async (bucketName, key) => {
     try {
         const command = new GetObjectCommand({ Bucket: bucketName, Key: key });
         return await getSignedUrl(s3Client, command, { expiresIn: 3600 });
-    } catch (error) { return null; }
+    } catch (error) { 
+        return null; 
+    }
 };
 
 const processQueue = async () => {
@@ -68,6 +71,7 @@ const processQueue = async () => {
     runningUploads++;
     
     const { fileId, fileName, r2Key } = task;
+    console.log(`[Upload] Starting: ${fileName}`);
     
     try {
         const token = cachedAccessToken || await getAccessToken();
@@ -85,37 +89,58 @@ const processQueue = async () => {
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: r2Key,
                 Body: response.data.pipe(new stream.PassThrough()),
-                ContentType: response.headers['content-type'] || 'video/x-matroska',
+                ContentType: response.headers['content-type'] || 'application/octet-stream',
                 ContentDisposition: `attachment; filename="${fileName}"`
             },
             queueSize: 3, 
-            partSize: 15 * 1024 * 1024 
+            partSize: 10 * 1024 * 1024 // 10MB chunks
         });
 
         await upload.done();
         console.log(`[Success] ${fileName}`);
+        activeUploads.delete(fileId);
     } catch (err) {
-        if (err.response?.status === 404) failedFiles.add(fileId);
+        console.error(`[Upload Failed] ID: ${fileId} - Error:`, err.message);
+        failedFiles.add(fileId);
         activeUploads.delete(fileId);
     } finally {
         runningUploads--;
-        setTimeout(processQueue, 300);
+        setTimeout(processQueue, 500);
     }
 };
 
+// --- Favicon handling (To avoid 400 errors) ---
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+
+// --- Root check ---
+app.get('/', (req, res) => res.send("R2 Bridge API is running..."));
+
+// --- Main File Handler ---
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
-    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
 
-    if (failedFiles.has(fileId)) return res.status(404).json({ status: "error", message: "File failed previously" });
+    if (!fileId || fileId.length < 15) {
+        return res.status(400).json({ status: "error", message: "Invalid File ID" });
+    }
+
+    if (failedFiles.has(fileId)) {
+        return res.status(410).json({ status: "error", message: "File download failed on previous attempt." });
+    }
 
     try {
         const token = cachedAccessToken || await getAccessToken();
+        if (!token) throw new Error("Could not retrieve Google Access Token");
         
-        // ১. মেটাডাটা উদ্ধার
-        const metaRes = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size`, {
-            headers: { Authorization: `Bearer ${token}` }
-        });
+        // ১. মেটাডাটা উদ্ধার (ফাইল আছে কি না চেক)
+        let metaRes;
+        try {
+            metaRes = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size,mimeType`, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+        } catch (gErr) {
+            console.error(`[Google API Error] ID: ${fileId}`, gErr.response?.data || gErr.message);
+            return res.status(404).json({ status: "error", message: "File not found on Google Drive or no permission." });
+        }
 
         const fileName = metaRes.data.name;
         const r2Key = fileName;
@@ -128,15 +153,19 @@ app.get('/:fileId', async (req, res) => {
             }));
             
             const presignedUrl = await generatePresignedUrl(process.env.R2_BUCKET_NAME, r2Key);
+            const publicUrl = `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(r2Key)}`;
             
             return res.json({
                 status: "success",
                 filename: fileName,
                 size: headData.ContentLength,
-                url: `${process.env.R2_PUBLIC_DOMAIN}/${encodeURIComponent(r2Key)}`,
+                url: publicUrl,
                 presigned_url: presignedUrl
             });
-        } catch (e) { /* ফাইল নেই, আপলোড শুরু হবে */ }
+        } catch (e) { 
+            // ফাইল R2 তে নেই, আপলোড শুরু হবে
+            console.log(`[Queue] File not in R2, adding to queue: ${fileName}`);
+        }
 
         // ৩. কিউতে যুক্ত করা
         if (!activeUploads.has(fileId)) {
@@ -148,12 +177,13 @@ app.get('/:fileId', async (req, res) => {
         res.json({
             status: "processing",
             filename: fileName,
-            message: "File is being uploaded to R2",
+            message: "File is being uploaded to R2. Please check back in a few minutes.",
             queue_length: uploadQueue.length
         });
 
     } catch (error) {
-        res.status(500).json({ status: "error", message: "Google API Error" });
+        console.error("[System Error]", error.message);
+        res.status(500).json({ status: "error", message: "Internal Server Error" });
     }
 });
 
