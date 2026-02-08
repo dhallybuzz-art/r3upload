@@ -28,23 +28,29 @@ const activeUploads = new Set();
 
 // Google Access Token পাওয়ার ফাংশন
 const getAccessToken = async () => {
-    const res = await axios.post('https://oauth2.googleapis.com/token', {
-        client_id: GD_CONFIG.clientId,
-        client_secret: GD_CONFIG.clientSecret,
-        refresh_token: GD_CONFIG.refreshToken,
-        grant_type: 'refresh_token'
-    });
-    return res.data.access_token;
+    try {
+        const res = await axios.post('https://oauth2.googleapis.com/token', {
+            client_id: GD_CONFIG.clientId,
+            client_secret: GD_CONFIG.clientSecret,
+            refresh_token: GD_CONFIG.refreshToken,
+            grant_type: 'refresh_token'
+        });
+        return res.data.access_token;
+    } catch (error) {
+        console.error("[Auth Error] Failed to refresh token.");
+        return null;
+    }
 };
 
-// এই ফাংশনটি সরাসরি গুগল থেকে ডাটা নিয়ে আর২-তে স্ট্রিমিং করবে
+// সরাসরি গুগল থেকে ডাটা নিয়ে R2-তে স্ট্রিমিং করার ফাংশন
 const startDirectTransfer = async (fileId, fileName) => {
     if (activeUploads.has(fileId)) return;
     activeUploads.add(fileId);
 
     try {
         const token = await getAccessToken();
-        
+        if (!token) throw new Error("Auth Token not available");
+
         // ১. গুগল ড্রাইভ থেকে ডাটা স্ট্রিম আনা
         const response = await axios({
             method: 'get',
@@ -53,73 +59,91 @@ const startDirectTransfer = async (fileId, fileName) => {
             responseType: 'stream'
         });
 
-        // ২. AWS SDK দিয়ে সরাসরি R2 তে আপলোড (এটি গ্যারান্টিড AWS4 Signature ব্যবহার করে)
+        // ২. AWS SDK দিয়ে সরাসরি R2 তে মাল্টিপার্ট আপলোড
         const parallelUploads3 = new Upload({
             client: s3Client,
             params: {
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: fileName,
-                Body: response.data, 
+                Body: response.data,
             },
             queueSize: 4, 
             partSize: 10 * 1024 * 1024, // 10MB চাঙ্ক
             leavePartsOnError: false,
         });
 
-        console.log(`[Stream] Transferring: ${fileName}`);
+        console.log(`[Stream Start] Transferring: ${fileName}`);
         await parallelUploads3.done();
-        console.log(`[Success] Uploaded to R2: ${fileName}`);
+        console.log(`[Stream Success] Uploaded to R2: ${fileName}`);
     } catch (err) {
-        console.error(`[Error] Direct Transfer Failed:`, err.message);
+        console.error(`[Stream Error] ${fileName}:`, err.message);
     } finally {
         activeUploads.delete(fileId);
     }
 };
 
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.get('/', (req, res) => res.send("Direct R2 Bridge is active."));
+app.get('/', (req, res) => res.send("Direct R2 Bridge Engine is running."));
 
 app.get('/:fileId', async (req, res) => {
     const fileId = req.params.fileId.trim();
-    if (!fileId || fileId.length < 15) return res.status(400).send("Invalid ID");
+    if (!fileId || fileId.length < 15) return res.status(400).json({ status: "error", message: "Invalid ID" });
 
     try {
         const token = await getAccessToken();
-        const meta = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name`, {
+        if (!token) return res.status(500).json({ status: "error", message: "Google Auth Failed" });
+
+        // ফাইল মেটাডাটা (নাম এবং সাইজ) উদ্ধার
+        const meta = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size`, {
             headers: { Authorization: `Bearer ${token}` }
         });
+        
         const fileName = meta.data.name;
+        const fileSize = meta.data.size;
 
         try {
-            // ১. বাকেটে ফাইল আছে কি না চেক
-            await s3Client.send(new HeadObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: fileName }));
+            // ১. বাকেটে ফাইল আছে কি না চেক করা
+            const headData = await s3Client.send(new HeadObjectCommand({ 
+                Bucket: process.env.R2_BUCKET_NAME, 
+                Key: fileName 
+            }));
             
-            // ২. presigned_url তৈরি করা
-            const presignedUrl = await getSignedUrl(s3Client, new GetObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: fileName }), { expiresIn: 3600 });
+            // ২. Presigned URL তৈরি করা (১ ঘণ্টা মেয়াদী)
+            const presignedUrl = await getSignedUrl(
+                s3Client, 
+                new GetObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: fileName }), 
+                { expiresIn: 3600 }
+            );
             
-            // ৩. পাবলিক ডোমেইন ইউআরএল তৈরি (স্ল্যাশ ম্যানেজমেন্টসহ)
-            const publicDomain = process.env.R2_PUBLIC_DOMAIN.replace(/\/$/, '');
+            // ৩. পাবলিক ইউআরএল কনস্ট্রাকশন
+            const publicDomain = (process.env.R2_PUBLIC_DOMAIN || '').replace(/\/$/, '');
             const publicUrl = `${publicDomain}/${encodeURIComponent(fileName)}`;
             
-            // আপনার চাহিত ফরম্যাটে রেসপন্স
             return res.json({ 
                 status: "success", 
-                filename: fileName, 
+                filename: fileName,
+                size: headData.ContentLength || fileSize,
                 url: publicUrl, 
                 presigned_url: presignedUrl 
             });
+
         } catch (e) {
-            // ফাইল নেই, তাই সরাসরি ট্রান্সফার শুরু
+            // ফাইল R2-তে না থাকলে ট্রান্সফার শুরু করা
             startDirectTransfer(fileId, fileName);
+            
             res.json({ 
                 status: "processing", 
-                filename: fileName, 
-                message: "Streaming data directly to R2 using AWS SDK." 
+                filename: fileName,
+                size: fileSize,
+                message: "Streaming data directly to R2. Please wait and refresh." 
             });
         }
     } catch (err) {
-        res.status(500).send("API Error: " + err.message);
+        res.status(err.response?.status || 500).json({ 
+            status: "error", 
+            message: err.response?.data?.error?.message || err.message 
+        });
     }
 });
 
-app.listen(PORT, () => console.log(`Direct Worker active on ${PORT}`));
+app.listen(PORT, () => console.log(`Engine active on port ${PORT}`));
