@@ -61,15 +61,16 @@ const processQueue = async () => {
     const task = uploadQueue.shift(); 
     runningUploads++;
     const { fileId, fileName, r2Key } = task;
-    console.log(`[Queue] Starting Rclone Transfer for: ${fileName}`);
+    console.log(`[System] Final Attempt Initiated for: ${fileName}`);
     
     try {
         const token = cachedAccessToken || await getAccessToken();
         
-        // আরক্লোন-কে সরাসরি কনফিগারেশন পাস করা হচ্ছে স্ট্রিং হিসেবে। 
-        // এটি 'Config file not found' এররটি বন্ধ করবে এবং R2-এর জন্য AWS4 নিশ্চিত করবে।
+        // এন্ডপয়েন্ট থেকে https:// সরিয়ে দেওয়া হয়েছে যাতে ডাবল না হয়
+        const r2Endpoint = `${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+
         const rcloneCmd = `rclone copyurl "https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true" \
-        :s3,provider=Cloudflare,endpoint="https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com",access_key_id="${process.env.R2_ACCESS_KEY}",secret_access_key="${process.env.R2_SECRET_KEY}",region=auto,v2_auth=false:"${process.env.R2_BUCKET_NAME}/${r2Key}" \
+        :s3,provider=Cloudflare,endpoint="${r2Endpoint}",access_key_id="${process.env.R2_ACCESS_KEY}",secret_access_key="${process.env.R2_SECRET_KEY}",region=auto,v2_auth=false:"${process.env.R2_BUCKET_NAME}/${r2Key}" \
         --header "Authorization: Bearer ${token}" \
         --s3-no-check-bucket \
         --ignore-errors \
@@ -78,17 +79,18 @@ const processQueue = async () => {
         exec(rcloneCmd, (error, stdout, stderr) => {
             activeUploads.delete(fileId);
             runningUploads--;
+            
             if (error) {
-                console.error(`[Rclone Error Detailed]:`, stderr);
+                console.error(`[Fatal Error] Detailed Log:`, stderr);
                 failedFiles.add(fileId);
             } else {
-                console.log(`[Success] Finished Transfer: ${fileName}`);
+                console.log(`[Success] Transfer Completed: ${fileName}`);
             }
             setTimeout(processQueue, 1500);
         });
 
     } catch (err) {
-        console.error(`[Internal Error] ID: ${fileId} - ${err.message}`);
+        console.error(`[Critical Error] ${err.message}`);
         activeUploads.delete(fileId);
         runningUploads--;
         setTimeout(processQueue, 1500);
